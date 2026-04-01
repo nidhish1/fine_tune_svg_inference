@@ -12,6 +12,14 @@ csv.field_size_limit(sys.maxsize)
 
 
 def build_prefix(prompt: str, output_mode: str) -> str:
+    if output_mode == "serialization_prefill":
+        return (
+            f"Prompt:\n{prompt}\n\n"
+            "Generate structured SVG targets.\n"
+            "layout_target: {}\n"
+            "detail_target: {}\n"
+            "serialization_target: <svg xmlns=\"http://www.w3.org/2000/svg\" "
+        )
     if output_mode == "svg_only":
         return (
             f"Prompt:\n{prompt}\n\n"
@@ -121,8 +129,8 @@ def main():
     parser.add_argument(
         "--output-mode",
         default="structured",
-        choices=["structured", "svg_only"],
-        help="Generation mode: training-style structured targets or direct SVG only",
+        choices=["structured", "svg_only", "serialization_prefill"],
+        help="Generation mode: structured, direct SVG-only, or serialization-prefill for SVG continuation",
     )
     args = parser.parse_args()
 
