@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import os
 import random
 import sys
 from pathlib import Path
@@ -25,6 +26,16 @@ def read_rows(csv_path: Path, id_col: str, prompt_col: str) -> list[dict]:
             if prompt:
                 rows.append({"sample_id": sample_id, "prompt": prompt})
     return rows
+
+
+def maybe_init_distributed(torch_mod):
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    rank = int(os.environ.get("RANK", "0"))
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    if world_size > 1 and not torch_mod.distributed.is_initialized():
+        backend = "nccl" if torch_mod.cuda.is_available() else "gloo"
+        torch_mod.distributed.init_process_group(backend=backend)
+    return rank, local_rank, world_size
 
 
 def pick_dtype(dtype_name: str, torch_mod):
@@ -67,6 +78,11 @@ def main():
         help="Output CSV path",
     )
     parser.add_argument(
+        "--keep-shards",
+        action="store_true",
+        help="Keep intermediate per-rank shard CSV files",
+    )
+    parser.add_argument(
         "--max-new-tokens",
         type=int,
         default=512,
@@ -100,6 +116,8 @@ def main():
     import torch
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
+    rank, local_rank, world_size = maybe_init_distributed(torch)
+
     model_path = Path(args.model_path).resolve()
     prompts_csv = Path(args.prompts_csv).resolve()
     output_csv = Path(args.output_csv).resolve()
@@ -117,8 +135,10 @@ def main():
     rng = random.Random(args.seed)
     sample_size = max(1, min(args.sample_size, len(rows)))
     sampled = rng.sample(rows, sample_size)
+    local_sampled = sampled[rank::world_size]
 
-    print(f"Loading tokenizer from: {model_path}")
+    if rank == 0:
+        print(f"Loading tokenizer from: {model_path}")
     tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
@@ -130,16 +150,27 @@ def main():
     elif torch.cuda.is_available() and torch.cuda.is_bf16_supported():
         load_kwargs["torch_dtype"] = torch.bfloat16
 
-    print(f"Loading model from: {model_path}")
+    if rank == 0:
+        print(f"Loading model from: {model_path}")
     model = AutoModelForCausalLM.from_pretrained(model_path, **load_kwargs)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if torch.cuda.is_available():
+        if world_size > 1:
+            torch.cuda.set_device(local_rank)
+            device = torch.device(f"cuda:{local_rank}")
+        else:
+            device = torch.device("cuda")
+    else:
+        device = torch.device("cpu")
     model.to(device)
     model.eval()
-    print(f"Running on device: {device}")
+    print(
+        f"[rank {rank}/{world_size}] device={device} "
+        f"global_samples={len(sampled)} local_samples={len(local_sampled)}"
+    )
 
     out_rows: list[dict] = []
     with torch.no_grad():
-        for i, row in enumerate(sampled, 1):
+        for i, row in enumerate(local_sampled, 1):
             prompt = row["prompt"]
             prefix = build_prefix(prompt)
             enc = tokenizer(prefix, return_tensors="pt").to(device)
@@ -165,14 +196,43 @@ def main():
                     "generated_text": generated_text,
                 }
             )
-            print(f"[{i}/{sample_size}] sample_id={row['sample_id']}")
+            print(f"[rank {rank}] [{i}/{len(local_sampled)}] sample_id={row['sample_id']}")
 
-    with output_csv.open("w", newline="", encoding="utf-8") as f:
+    shard_csv = output_csv.with_suffix(f".rank{rank}.csv")
+    with shard_csv.open("w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=["sample_id", "prompt", "generated_text"])
         writer.writeheader()
         writer.writerows(out_rows)
+    print(f"[rank {rank}] Saved shard: {shard_csv}")
 
-    print(f"Saved {len(out_rows)} generations to: {output_csv}")
+    if world_size > 1:
+        torch.distributed.barrier()
+
+    if rank == 0:
+        merged_rows: list[dict] = []
+        for r in range(world_size):
+            shard = output_csv.with_suffix(f".rank{r}.csv")
+            if not shard.exists():
+                continue
+            with shard.open("r", newline="", encoding="utf-8") as f:
+                merged_rows.extend(csv.DictReader(f))
+
+        with output_csv.open("w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=["sample_id", "prompt", "generated_text"])
+            writer.writeheader()
+            writer.writerows(merged_rows)
+
+        if world_size > 1 and not args.keep_shards:
+            for r in range(world_size):
+                shard = output_csv.with_suffix(f".rank{r}.csv")
+                if shard.exists():
+                    shard.unlink()
+
+        print(f"Saved {len(merged_rows)} generations to: {output_csv}")
+
+    if world_size > 1 and torch.distributed.is_initialized():
+        torch.distributed.barrier()
+        torch.distributed.destroy_process_group()
 
 
 if __name__ == "__main__":
