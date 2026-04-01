@@ -11,8 +11,15 @@ from pathlib import Path
 csv.field_size_limit(sys.maxsize)
 
 
-def build_prefix(prompt: str) -> str:
-    # Keep inference prompt contract aligned with training.
+def build_prefix(prompt: str, output_mode: str) -> str:
+    if output_mode == "svg_only":
+        return (
+            f"Prompt:\n{prompt}\n\n"
+            "Generate a valid SVG image.\n"
+            "Output only one complete <svg ...>...</svg> block.\n"
+            "Do not output layout_target, detail_target, or any extra text.\n\n"
+        )
+    # Keep default inference prompt contract aligned with training.
     return f"Prompt:\n{prompt}\n\nGenerate structured SVG targets.\n\n"
 
 
@@ -111,6 +118,12 @@ def main():
         choices=["auto", "bf16", "fp16", "fp32"],
         help="Torch dtype override for model weights",
     )
+    parser.add_argument(
+        "--output-mode",
+        default="structured",
+        choices=["structured", "svg_only"],
+        help="Generation mode: training-style structured targets or direct SVG only",
+    )
     args = parser.parse_args()
 
     import torch
@@ -172,7 +185,7 @@ def main():
     with torch.no_grad():
         for i, row in enumerate(local_sampled, 1):
             prompt = row["prompt"]
-            prefix = build_prefix(prompt)
+            prefix = build_prefix(prompt, args.output_mode)
             enc = tokenizer(prefix, return_tensors="pt").to(device)
 
             gen_kwargs = {

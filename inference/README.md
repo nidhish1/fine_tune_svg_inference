@@ -82,3 +82,15 @@ python3 run_inference.py \
   - diversity
   - prompt faithfulness
 
+## Final inference command
+
+```bash
+torchrun --nproc_per_node=4 inference/run_inference.py \
+  --model-path ~/fine_tining_dsitributed_m100/outputs_final_4gpu/best_model \
+  --prompts-csv <YOUR_FINAL_PROMPTS_CSV> \
+  --sample-size <N_OR_FULL> \
+  --max-new-tokens 1024 \
+  --dtype bf16 \
+  --output-csv ~/fine_tune_svg_inference/inference/outputs/final_raw_generations.csv
+```
+
