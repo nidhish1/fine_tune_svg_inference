@@ -137,7 +137,7 @@ To keep runs reproducible and robust, we use deterministic preprocessing, fixed 
     \centering
     % TODO: replace with your actual screenshot path
     \includegraphics[width=0.92\linewidth]{figures/training_setup_screenshot.png}
-    \caption{Training setup snapshot (hardware/software config, run command, and key hyperparameter settings). Replace this placeholder with your screenshot.}
+    \caption{We used a PyTorch + Hugging Face (Transformers/Accelerate) stack with mixed-precision bf16, distributed multi-GPU training/inference via torchrun (NCCL backend) on A100-class GPUs, and a Kaggle single-GPU inference variant for final submission generation.}
     \label{fig:training-setup-screenshot}
 \end{figure}
 \FloatBarrier
@@ -214,13 +214,165 @@ In addition to validity, we track a graphics-content signal (presence of drawabl
 This yields both repaired SVG strings and audit metadata (repair status, validity flags, graphics flags) used by later selection stages.
 
 \subsection{Hybrid Selection and Fallback Strategy}
-No single generation pass is uniformly best across all prompts, so final submission construction uses row-level hybrid selection.
-Our primary source is repaired model output; fallback rows are filled from a secondary source (e.g., prior high-validity submission or retrieval-backed candidate) when the primary row fails strict checks or is judged low-confidence.
+No single generation pass is uniformly best across all prompts, so final submission construction uses row-level hybrid selection with a retrieval-assisted fallback tier.
+Our primary source is repaired model output; fallback rows are filled from a secondary source when the primary row fails strict checks or is judged low-confidence.
 Selection is deterministic and ID-aligned, ensuring exactly one SVG per required test ID with no duplication.
+
+\paragraph{Retrieval preprocessing and feature extraction}
+Before retrieval, prompts are cleaned by removing the fixed instruction prefix/suffix template so similarity is computed on the semantic core description only.
+For all training SVGs, we precompute two retrieval-side structural features: \texttt{has\_fill} (filled vs.\ stroke-only behavior) and \texttt{n\_paths} (shape-count proxy for visual complexity).
+We also extract prompt keywords from a curated 68-term visual lexicon and compute keyword-overlap similarity using Jaccard score.
+
+\paragraph{Intent extraction and routing priors}
+For each test prompt, we compute binary intent flags: \texttt{is\_outline}, \texttt{is\_logo}, \texttt{has\_number}, \texttt{is\_complex}, and \texttt{wants\_fill}.
+Prompts marked logo-like, number-sensitive, or highly complex are forced to use the LLM path via \texttt{must\_llm}, because direct retrieval reuse is brittle for these cases.
+These intent signals are also used as re-ranking bonuses/penalties to prefer stroke-like or filled candidates when requested.
+
+\begin{figure}[!ht]
+    \centering
+    \footnotesize
+    \fbox{
+        \begin{minipage}{0.95\linewidth}
+        \textbf{Retrieval preprocessing flow:}\\
+        Raw prompt $\rightarrow$ Prompt cleaning $\rightarrow$ Clean prompt text\\
+        Clean prompt text $\rightarrow$ Keyword extraction (68-term lexicon) $\rightarrow$ Keyword-overlap signal (Jaccard)\\
+        Training SVG pool $\rightarrow$ Precompute \texttt{has\_fill}, \texttt{n\_paths}\\
+        Clean prompt text $\rightarrow$ Intent extraction (\texttt{is\_outline}, \texttt{is\_logo}, \texttt{has\_number}, \texttt{is\_complex}, \texttt{wants\_fill})\\
+        Intent flags $\rightarrow$ \texttt{must\_llm} prior and re-ranking bonuses/penalties\\
+        Combined signals $\rightarrow$ Retrieval scoring $\rightarrow$ Routing decision
+        \end{minipage}
+    }
+    \caption{Compact diagram of retrieval preprocessing, intent extraction, and routing priors.}
+    \label{fig:retrieval-preprocess-flow}
+\end{figure}
+\FloatBarrier
+
+\paragraph{Dual-encoder retrieval and intent-aware re-ranking}
+Candidate retrieval uses two sentence-transformer encoders with weighted cosine fusion:
+\texttt{all-MiniLM-L6-v2} (weight 0.35) and \texttt{all-mpnet-base-v2} (weight 0.65), with L2-normalized embeddings.
+For each test row, we select top-$k$ candidates by fused similarity ($k=5$), then apply composite intent-aware re-ranking:
+\[
+s = 0.93 \cdot e + 0.07 \cdot \mathrm{Jaccard}_{\mathrm{kw}} + \mathrm{bonus},
+\]
+where $e$ is dual-encoder cosine similarity, $\mathrm{Jaccard}_{\mathrm{kw}}$ is keyword overlap, and \texttt{bonus} encodes intent-specific preferences (fill/stroke match and small complexity bonus from path count).
+The highest-scoring candidate provides the Tier-1 retrieval SVG and confidence score.
+These encoders are retrieval/ranking utilities only; they do not generate SVG outputs.
+
+\paragraph{Tier routing and conservative recoloring}
+Tier-2 routing is triggered when \texttt{must\_llm} is true or retrieval confidence falls below threshold (\texttt{sim} $< 0.88$).
+In Tier-2, SVG generation is performed by the same fine-tuned Qwen2.5-3B model used throughout this work (no additional generative model is introduced).
+Before finalizing retrieval output, we optionally apply conservative color correction: recoloring is allowed only when the prompt is not outline-only, the candidate is not stroke-only, the prompt explicitly requests chromatic colors, and the dominant candidate color family conflicts with prompt intent.
+This prevents over-aggressive edits while still correcting obvious color-family mismatch.
 
 \paragraph{Final assembly}
 After hybrid selection, we run one final compliance sweep over the full submission file.
 This last pass verifies schema-level consistency (\texttt{id}, \texttt{svg}), uniqueness/coverage of IDs, and validator-facing SVG constraints before export.
 The resulting pipeline converts partially reliable raw generation into a robust, competition-ready submission artifact.
+
+\begin{figure}[!ht]
+    \centering
+    \includegraphics[width=0.92\linewidth]{figures/final_pipeline_diagram.png}
+    \caption{End-to-end final assembly and hybrid selection pipeline.}
+    \label{fig:final-assembly-pipeline}
+\end{figure}
+\FloatBarrier
+
+In summary, the hybrid stage combines semantic retrieval, intent-aware scoring, safe color adaptation, and confidence-based fallback to the same fine-tuned generator to improve reliability on hard prompts without sacrificing deterministic submission behavior.
+
+\section{Experiments and Results}
+
+\subsection{Experimental Setup}
+We evaluate on a 1,000-prompt test subset, using the same submission-oriented pipeline described in Section~3.
+Inference is run with deterministic greedy decoding and a fixed generation budget (\texttt{max\_new\_tokens}), so output variability is controlled across reruns.
+Evaluation is reported in three stages: (i) raw generations before repair, (ii) deterministic repair output, and (iii) final hybrid submission after fallback-based row selection and final compliance checks.
+
+\subsection{Main Quantitative Results}
+Table~\ref{tab:main-results} summarizes the primary outcomes.
+Before repair, only 346/1000 generations are valid XML (34.6\%), even though 347/1000 rows contain a full \texttt{<svg ... </svg>} span.
+This confirms that many failures are near-valid but still rejected by strict parsing/structure checks.
+Applying minimal deterministic repair recovers 651 additional rows.
+After hybrid selection and final validation, the final submission is fully valid with complete ID coverage (1000/1000).
+
+\begin{table}[!htbp]
+    \centering
+    \small
+    \begin{tabular}{p{0.68\linewidth} p{0.24\linewidth}}
+        \hline
+        \textbf{Metric} & \textbf{Value} \\
+        \hline
+        Raw valid XML before repair & 346/1000 (34.6\%) \\
+        Rows with full \texttt{<svg ... </svg>} block & 347/1000 \\
+        Additional rows recovered by minimal deterministic repair & 651 \\
+        Final hybrid submission validity & 1000/1000 \\
+        \hline
+    \end{tabular}
+    \caption{Main quantitative results across raw generation, repair, and final hybrid submission.}
+    \label{tab:main-results}
+\end{table}
+
+\subsection{Ablation / Contribution Analysis}
+We analyze the contribution of each pipeline stage under a fixed 1,000-prompt setting and identical validator checks.
+Table~\ref{tab:ablation-results} reports cumulative validity as components are added.
+The largest gain comes from deterministic repair, confirming that most failures are near-valid structural errors rather than complete semantic misses.
+Hybrid selection then closes the remaining gap to full coverage by replacing unresolved rows with validated fallback outputs.
+
+\begin{table}[!htbp]
+    \centering
+    \small
+    \begin{tabular}{p{0.68\linewidth} p{0.24\linewidth}}
+        \hline
+        \textbf{Pipeline Variant} & \textbf{Valid XML} \\
+        \hline
+        Raw generation only (no repair, no hybrid) & 346/1000 (34.6\%) \\
+        + Deterministic repair & 997/1000 (99.7\%) \\
+        + Hybrid fallback selection (final system) & 1000/1000 (100.0\%) \\
+        \hline
+    \end{tabular}
+    \caption{Ablation-style cumulative contribution of major pipeline components.}
+    \label{tab:ablation-results}
+\end{table}
+
+\subsection{Alternative Methods and Iterative Improvements}
+Our final system emerged from several intermediate approaches that were useful for diagnosing failure modes.
+First, we tested few-shot prompting on the base (non-fine-tuned) model.
+Although this improved local formatting in some rows, it remained unreliable under strict validator constraints and often failed to produce submission-ready SVG at scale.
+
+Second, we trained without canonicalization.
+This setting increased target-format variance and led to poorer serialization behavior, with more malformed endings and lower consistency in generated SVG structure.
+Empirically, non-canonicalized training produced weaker SVG validity and was not retained.
+
+Third, we evaluated an early fine-tuned model after two epochs.
+This model improved semantic alignment relative to base prompting, but complete SVG closure remained weak: fewer than 10\% of rows produced full \texttt{<svg ... </svg>} outputs in our early checks.
+This exposed serialization completion---not semantic grounding---as the dominant bottleneck.
+
+We then introduced a one-run constraint-aware continuation stage focused on serialization quality.
+This produced the strongest raw generations among all training variants, with substantially more structurally correct outputs, though many still required deterministic repair.
+After repair, we applied our final hybrid strategy (retrieval-assisted fallback plus strict final validation), yielding robust end-to-end submission quality.
+
+\section{Limitations and Failure Cases}
+Despite strong submission validity, the pipeline still has important limitations.
+First, semantic fidelity is not guaranteed by XML validity: some repaired outputs are structurally correct but visually simplistic or only loosely aligned with prompt intent.
+Second, retrieval can fail when lexical overlap is misleading or when a prompt describes uncommon compositions; in these cases, high similarity scores may still return semantically mismatched exemplars.
+Third, deterministic repair is intentionally conservative and syntax-oriented, so it can recover structure but cannot reliably invent missing semantic detail after severe truncation.
+As a result, the system is strongest at converting near-valid generations into compliant SVGs, but weaker on truly hard prompts requiring precise symbolic or compositional reasoning.
+
+\section{Conclusion}
+We presented a constraint-aware text-to-SVG pipeline that combines fine-tuned causal generation with deterministic repair and hybrid fallback selection.
+On a 1,000-prompt evaluation, raw valid XML before repair is 346/1000 (34.6\%), deterministic repair raises validity to 997/1000 (99.7\%), and final hybrid assembly achieves 1000/1000 submission-valid rows.
+These results show that submission robustness is driven not only by model quality, but by end-to-end systems design spanning preprocessing, constrained training, repair, and final compliance checks.
+Our experiments also indicate that canonicalization and serialization-focused continuation are key to reducing truncation-related failures.
+Overall, the approach provides a practical and reproducible recipe for competition-grade SVG generation under strict validator constraints.
+
+\section*{References (Key Works)}
+\begin{itemize}
+    \item Carlier, A., Danelljan, M., Alahi, A., Timofte, R., and Van Gool, L. 2020. \textit{DeepSVG: A Hierarchical Generative Network for Vector Graphics Animation}. NeurIPS.
+    \item Reimers, N. and Gurevych, I. 2019. \textit{Sentence-BERT: Sentence Embeddings using Siamese BERT-Networks}. EMNLP-IJCNLP.
+    \item Song, K., Tan, X., Qin, T., Lu, J., and Liu, T.-Y. 2020. \textit{MPNet: Masked and Permuted Pre-training for Language Understanding}. NeurIPS.
+    \item Post, M. and Vilar, D. 2018. \textit{Fast Lexically Constrained Decoding with Dynamic Beam Allocation for Neural Machine Translation}. NAACL.
+    \item Lewis, P., Perez, E., Piktus, A., et al. 2020. \textit{Retrieval-Augmented Generation for Knowledge-Intensive NLP Tasks}. NeurIPS.
+\end{itemize}
+
+\bibliographystyle{acl_natbib}
+
 
 \end{document}
