@@ -1,0 +1,226 @@
+% This must be in the first 5 lines to tell arXiv to use pdfLaTeX, which is strongly recommended.
+\pdfoutput=1
+% In particular, the hyperref package requires pdfLaTeX in order to break URLs across lines.
+
+\documentclass[11pt]{article}
+
+% Remove the "review" option to generate the final version.
+\usepackage{ACL2023}
+
+% Standard package includes
+\usepackage{times}
+\usepackage{latexsym}
+\usepackage{graphicx}
+
+% For proper rendering and hyphenation of words containing Latin characters (including in bib files)
+\usepackage[T1]{fontenc}
+
+% This assumes your files are encoded as UTF8
+\usepackage[utf8]{inputenc}
+
+% Improves layout and spacing
+\usepackage{microtype}
+\usepackage{placeins}
+\usepackage{amsmath}
+\usepackage{inconsolata}
+
+\title{Constraint-Aware Causal LM Fine-Tuning with Serialization-Focused Continuation, Deterministic Post-Generation Repair, and Hybrid Selection for Text-to-SVG}
+
+\author{Nidhish Gautam (ng3483) \and Dheeraj Pakala (dp4086) \\
+New York University (NYU)}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+We present a practical, constraint-aware pipeline for text-to-SVG generation under strict submission rules.
+Our approach uses a causal language model (Qwen2.5-3B) fine-tuned with a serialization-focused continuation strategy to improve completion of final SVG outputs.
+While raw generations often contain truncation and formatting errors, we show that many failures are near-valid and can be recovered with deterministic post-generation repair.
+We combine model outputs with rule-based validation, lightweight structural fixes, and hybrid row-level fallback selection to maximize final submission reliability.
+On a 1,000-prompt evaluation, raw valid XML before repair is substantially lower than final compliant output, highlighting the importance of integrating modeling with constraint-aware post-processing.
+The resulting system emphasizes robustness over single-pass generation purity and provides a reproducible recipe for competitive text-to-SVG submission pipelines.
+\end{abstract}
+
+\section{Introduction}
+Text-to-SVG generation is challenging because outputs must be both semantically correct and structurally valid programs.
+In competition settings, this is further constrained by strict submission rules (e.g., XML well-formedness, allowed tags, bounded complexity, and fixed output schema).
+As a result, the task is not only prompt-to-graphics generation, but also reliability engineering under hard validator constraints.
+
+Our primary pipeline is generation-first: we use a constraint-aware causal language model (Qwen2.5-3B) fine-tuned for SVG serialization quality, including a serialization-focused continuation stage to reduce truncation and malformed outputs.
+This model handles the majority of examples, followed by deterministic validation and repair to enforce submission compliance.
+
+For difficult cases, we introduce a retrieval-based fallback.
+Rather than invoking retrieval for every prompt, we trigger it selectively when generation confidence is low or when prompts exhibit hard characteristics (e.g., logo-like intent, number-heavy symbols, or high compositional complexity).
+The retrieval module normalizes prompts, extracts visual keywords and lightweight intent signals, and scores candidate training examples using a combination of embedding similarity, keyword overlap, and intent-aware re-ranking.
+When a strong candidate is found, we optionally apply conservative adaptation (such as limited color correction), then run the same validation and repair checks.
+
+This design keeps generation as the default path while using retrieval strategically as a robustness mechanism for failure-prone examples.
+Final submissions are produced through strict validation, deterministic repair, and row-level hybrid selection.
+Overall, the system combines generative flexibility with targeted retrieval support to balance quality, validity, and efficiency in competition-grade text-to-SVG pipelines.
+
+\section{Method}
+\subsection{Problem Setup and Constraints}
+We address text-to-SVG generation under strict competition constraints.
+Given a prompt $x$, the system must generate an SVG output $y$ such that:
+\begin{enumerate}
+    \item $y$ is well-formed XML with \texttt{<svg>} as the root element,
+    \item $y$ satisfies validator constraints (allowed tag set, bounded path count, bounded output length, and fixed submission schema), and
+    \item $y$ preserves the prompt-conditioned visual semantics.
+\end{enumerate}
+Thus, the task is not unconstrained text generation; it is constrained program generation with submission-time validity requirements.
+
+\section{Methodology}
+
+\subsection{Data Preprocessing and Canonicalization}
+Before training, we normalize raw SVG data using canonicalization and safe canonicalization.
+We measure target-format variance using root-level serialization signatures (unique \texttt{<svg ...>} attribute-order patterns).
+Canonicalization reduces this count from 115 to 48 (\textbf{58.3\%}), and safe canonicalization reduces it to 47 (\textbf{59.1\%}), yielding more consistent attribute ordering and cleaner target formatting.
+The XML parse-fail rate remains 0\% before and after canonicalization, while SVG length variance is reduced by 0.33\% (canonical) and 0.75\% (safe canonical).
+All constraint-aware normalization is applied to training SVG targets only; no test-time checker outputs or labels are used for training supervision.
+
+\begin{figure}[htbp]
+    \centering
+    \includegraphics[width=\linewidth]{figures/canonicalization_overview.png}
+    \caption{Example from our preprocessing pipeline showing the same sample before canonicalization (Original), after canonicalization, and after safe canonicalization.}
+    \label{fig:canonicalization-overview}
+\end{figure}
+\FloatBarrier
+
+\paragraph{Feature-engineered training schema}
+We build an enriched training table (\texttt{final\_training.csv}) with both structured and validator-aware signals.
+We also generate deterministic schema previews to verify column integrity and serialization consistency before training, reducing silent data-schema failures.
+Each feature is computed from canonicalized training targets and scene structure metadata to provide stable supervision signals for composition, geometry, compactness, and validator-facing correctness.
+Table~\ref{tab:feature-schema-fields} summarizes the engineered schema.
+
+\begin{table}[!htbp]
+    \centering
+    \small
+    \begin{tabular}{p{0.34\linewidth} p{0.60\linewidth}}
+        \hline
+        \textbf{Field(s)} & \textbf{Purpose} \\
+        \hline
+        \texttt{layout\_target}, \texttt{detail\_target}, \texttt{serialization\_target} & Staged supervision for global composition, object-level details, and final deterministic SVG serialization. \\
+        \texttt{scene\_version} & Tracks canonicalized scene representation variant for reproducibility and consistency. \\
+        \texttt{object\_count} & Supervises scene complexity and expected number of visual elements. \\
+        \texttt{validity\_target} & Provides explicit compliance supervision for validator-facing correctness. \\
+        \texttt{compactness\_target} & Encourages concise SVG programs under length/complexity constraints. \\
+        \texttt{visibility\_ratio} & Captures how much generated content remains visually effective on canvas. \\
+        \texttt{overlap\_graph} & Encodes inter-object spatial overlap relationships for structural reasoning. \\
+        \texttt{path\_command\_histogram} & Summarizes geometric command usage patterns for shape/complexity control. \\
+        \texttt{structure\_proxy\_sequence} & Supplies lightweight sequential structure signals complementary to raw SVG text. \\
+        \texttt{fold\_id} & Identifies data split membership for robust training/evaluation partitioning. \\
+        \hline
+    \end{tabular}
+    \caption{Fields in \texttt{final\_training.csv} and their roles in structure, compliance, and serialization supervision.}
+    \label{tab:feature-schema-fields}
+\end{table}
+
+\begin{figure}[htbp]
+    \centering
+    \includegraphics[width=\linewidth]{figures/feature_engineered_training_sample_preview.png}
+    \caption{Feature-engineered training sample preview. Example row from \texttt{final\_training.csv} showing prompt, rendered SVG, and engineered feature fields used for staged supervision and constraint-aware training.}
+    \label{fig:feature-engineered-training-sample-preview}
+\end{figure}
+\FloatBarrier
+
+\subsection{Training Methodology}
+Our training follows a phased schedule to balance semantic learning and constraint compliance.
+We use mixed-precision (\texttt{bf16}) multi-GPU fine-tuning of a causal LM.
+
+\paragraph{Training setup}
+Our training stack is based on PyTorch and Hugging Face Transformers, executed in distributed multi-GPU mode.
+We run autoregressive fine-tuning for three epochs in total (Phase 1--2 standard fine-tuning, Phase 3 serialization-focused continuation), with checkpointing at intermediate steps for model selection.
+Data loading is driven by the feature-engineered training table (\texttt{final\_training.csv}), and training examples are serialized into the staged target contract before tokenization.
+To keep runs reproducible and robust, we use deterministic preprocessing, fixed target formatting, and a resume-friendly training workflow.
+
+\begin{figure}[!ht]
+    \centering
+    % TODO: replace with your actual screenshot path
+    \includegraphics[width=0.92\linewidth]{figures/training_setup_screenshot.png}
+    \caption{Training setup snapshot (hardware/software config, run command, and key hyperparameter settings). Replace this placeholder with your screenshot.}
+    \label{fig:training-setup-screenshot}
+\end{figure}
+\FloatBarrier
+
+\paragraph{Training instance format}
+Each supervised sample is serialized as a feature-conditioned training record with staged fields in a fixed order: \texttt{layout\_target} $\rightarrow$ \texttt{detail\_target} $\rightarrow$ \texttt{serialization\_target}.
+This consistent contract reduces formatting entropy and keeps optimization focused on predictable structure boundaries.
+In practice, the model learns both semantic mapping (prompt $\rightarrow$ scene structure) and deterministic string realization (scene structure $\rightarrow$ SVG text).
+
+\paragraph{Structured supervision (DSL-style staged targets)}
+Instead of supervising only raw final SVG text, we use a staged target representation:
+\begin{itemize}
+    \item \texttt{layout\_target}: global composition/canvas and object-slot structure,
+    \item \texttt{detail\_target}: object-level geometry and style fields,
+    \item \texttt{serialization\_target}: deterministic final SVG text.
+\end{itemize}
+This DSL-style decomposition separates high-level structure from final serialization while preserving the final SVG contract required for submission.
+It also provides intermediate supervision signals that make failure modes easier to localize during error analysis.
+Despite staged supervision, truncation remains a practical failure mode before complete \texttt{serialization\_target} closure; in a 1000-row run, only 346 rows are valid XML before repair (34.6\%).
+
+\paragraph{Phase 1--2: standard fine-tuning}
+In the first two epochs, we perform standard supervised autoregressive fine-tuning on feature-engineered training records with next-token prediction.
+Each record includes the prompt, staged targets (\texttt{layout\_target}, \texttt{detail\_target}, \texttt{serialization\_target}), and auxiliary structured fields used in our schema.
+During this stage, all staged targets participate in learning, so the model first stabilizes prompt-to-structure and prompt-to-geometry alignment before strict serialization refinement.
+
+\begin{figure}[!ht]
+    \centering
+    \includegraphics[width=0.78\linewidth]{figures/phase12_standard_finetuning.png}
+    \caption{Phase 1--2 standard fine-tuning overview.}
+    \label{fig:phase12-standard-finetuning}
+\end{figure}
+\FloatBarrier
+
+\paragraph{Phase 3: constraint-aware continuation}
+In the final epoch, we shift to a constraint-aware serialization-focused continuation stage.
+This phase prioritizes completion of valid \texttt{serialization\_target} outputs and reduces truncation-driven submission failures.
+Operationally, supervision is restricted to serialization behavior, with auxiliary objectives disabled in the strict run.
+Concretely, label supervision is concentrated on serialization-relevant tokens, so optimization pressure is directed at closing tags, maintaining valid XML structure, and reducing incomplete endings.
+
+\begin{figure}[!ht]
+    \centering
+    \includegraphics[width=0.95\linewidth]{figures/phase3_training_metrics_a.png}
+    \vspace{0.5em}
+    \includegraphics[width=0.95\linewidth]{figures/phase3_training_metrics_updated_b.png}
+    \caption{Phase 3 constraint-aware continuation training metrics (two runs/panels).}
+    \label{fig:phase3-training-metrics}
+\end{figure}
+\FloatBarrier
+
+\subsection{Inference Pipeline}
+At inference time, we prioritize determinism, resumability, and clean handoff to downstream repair.
+We run decoding in deterministic (greedy) mode with a fixed token budget (\texttt{max\_new\_tokens}) to reduce formatting variance across runs.
+When structured prompting is enabled, generation is anchored to the staged contract and serialization-prefill behavior so the model is encouraged to continue directly in the target SVG-oriented serialization format.
+
+\paragraph{Distributed and resume-safe execution}
+Inference is executed in distributed multi-GPU mode, where each rank processes a disjoint shard of the test set.
+Each rank writes outputs to its own shard CSV file with atomic append-style updates, enabling interruption-safe progress.
+Before processing, each rank loads already completed IDs from its shard and skips them, so reruns resume from unfinished examples instead of restarting the full split.
+After all ranks finish, rank 0 performs a deterministic merge of per-rank shards into a single raw generations file.
+
+\paragraph{Raw output extraction}
+Generated continuations are stored as raw text first, then parsed using marker-aware extraction to isolate the serialization payload.
+To handle prompt/template drift, extraction supports multiple marker variants (e.g., \texttt{serialization\_target:}, \texttt{serialization:}, \texttt{SVG target:}, and fallback markers) and selects the earliest reliable match.
+This step produces a canonical raw generations artifact for downstream deterministic repair and validation.
+
+\subsection{Deterministic Repair and Validation}
+Because many raw outputs are near-valid but structurally incomplete, we apply a deterministic repair pass before submission assembly.
+The repair stage is rule-based and fully reproducible: it crops to plausible SVG regions, strips prompt leakage/noise, recovers dangling shape-tag tails, trims to the last complete tag boundary, and enforces a valid closing structure.
+We then parse candidates as XML and retain repaired outputs that satisfy structural checks.
+
+\paragraph{Validator-facing checks}
+Post-repair validation enforces XML well-formedness, expected root structure, and submission-oriented constraints.
+In addition to validity, we track a graphics-content signal (presence of drawable primitives) to separate formally valid-but-empty outputs from practically useful rows.
+This yields both repaired SVG strings and audit metadata (repair status, validity flags, graphics flags) used by later selection stages.
+
+\subsection{Hybrid Selection and Fallback Strategy}
+No single generation pass is uniformly best across all prompts, so final submission construction uses row-level hybrid selection.
+Our primary source is repaired model output; fallback rows are filled from a secondary source (e.g., prior high-validity submission or retrieval-backed candidate) when the primary row fails strict checks or is judged low-confidence.
+Selection is deterministic and ID-aligned, ensuring exactly one SVG per required test ID with no duplication.
+
+\paragraph{Final assembly}
+After hybrid selection, we run one final compliance sweep over the full submission file.
+This last pass verifies schema-level consistency (\texttt{id}, \texttt{svg}), uniqueness/coverage of IDs, and validator-facing SVG constraints before export.
+The resulting pipeline converts partially reliable raw generation into a robust, competition-ready submission artifact.
+
+\end{document}
